@@ -1,0 +1,707 @@
+@ \section{Introduction}
+\label{sec:introduction}
+A word of warning is, I feel, necessary. Many people are not familiar with the style of code they are about to see. Unlike a traditional source structure where there are multiple files, each handling a smaller part of the program,
+here you will see all of [[cv]]. The parser, the code generator, the command line argument handler. Every part is here, and free for you to observe.
+
+Keeping in mind that [[noweb]] allows me to write code in any order I see fit, I see no reason that we cannot start quite simply with a short introduction to the high-level scope of how this program will work. We will revisit these ideas as necessary throughout this document, but it is always best to know where you are going before you start.
+
+The goal of [[cv]] is not to be a standard language compiler, in the sense that it has a tokeniser, a parser and a compiler. Instead we let [[cv]] recursively apply macro definitions until none are left, and we are in the ``base code''. This base code is then treated as a markup language that we can compile, or perhaps \emph{transpile}, to the various output formats such as HTML, \LaTeX{}, RTF, and plain text.
+
+This is where templates become involved. As the base code is built up, the \emph{chunks} and \emph{variables} that get built are passed on to the templates. These will insert the chunks and variables into appropriate places, meaning that the overall appearance is handled by the template, but the content comes from the [[.cv]] file, and the author thereof.
+
+\section{The [[cv]] macro language}
+\label{sec:macros}
+When considering the [[cv]] language from the point of view of the user, it should resemble the tools they are used to. Initially, these are likely to be people well-versed with at least some sort of markup language, likely HTML or \LaTeX{}. Thus we take as inspiration what is, in my opinion, the superior format: \TeX{}.
+
+At the most basic level, there are essentially two commands provided by [[cv]]: [[@input(path)]] and [[@define(name)(nargs)(substitution)]] (we also allow a [[@redefine]]). Although both fundamental, they are conceptually very different, and thus handled in very distinct ways. We consider them both now, starting with the [[@input]] command.
+
+<<Define how to input the contents of another file>>=
+void input(char* path, FILE* output)
+{
+    fprintf(LOGFILE, "I am attempting to input \"%s.cv\".\n", path);
+    <<Search all the input directories>>
+    FILE* to_input = fopen(full_path, "r");
+    if (to_input == NULL) {
+        fclose(to_input);
+        fprintf(stderr, "I could not open the file \"%s\" to copy to output. ", full_path);
+        fprintf(stderr, "Check that it exists, and that it is readable.\n");
+        <<Exit with an error>>
+    }
+    char next;
+    while ((next = fgetc(to_input)) != EOF) {
+        fputc(next, output);
+    }
+    fclose(to_input);
+    free(full_path);
+}
+
+@
+This is not a complicated procedure: open the file, and copy it character by character to the output stream. In general this output stream will be a file containing base code, but it may contain further macros. We will discuss this shortly in \ref{sec:compile-loop}.
+
+Because [[cv]] is likely to be too complex to program from scratch, we should let the user have some locations that store all their common input files. Thus when the user calls input, in addition to searching the local directory, we search [[~/.cv/]], as well as any other directories specified by command line flags.
+
+<<Search all the input directories>>=
+// Start with the local dir (or whole path if it was given that way)
+char* full_path = calloc(4096, sizeof(char));
+char* new_path = calloc(4096, sizeof(char));
+sprintf(new_path, "%s.cv", path);
+if (access(new_path, F_OK) != -1) {
+    full_path = memcpy(full_path, new_path, 4096);
+} else { // Now we check the command line argument dirs
+    free(new_path);
+    for (int i = 0; i < N_LIB_DIRS; i++) {
+        char* new_path = calloc(4096, sizeof(char));
+        sprintf(new_path, "%s/%s.cv", LIB_DIRS[i], path);
+        if (access(new_path, F_OK) != -1) {
+            full_path = memcpy(full_path, new_path, 4096);
+        }
+        free(new_path);
+    }
+    if (*full_path == '\0') { // Still no luck. Try ~/.cv/
+        char* new_path = calloc(4096, sizeof(char));
+        sprintf(new_path, "%s/.cv/%s.cv", getenv("HOME"), path);
+        if (access(new_path, F_OK) != -1) {
+            full_path = memcpy(full_path, new_path, 4096);
+        }
+        free(new_path);
+    }
+}
+if (*full_path == '\0') {
+    fprintf(stderr, "I cannot find the file \"%s.cv\". Check that you got that name right!\n", path);
+    <<Exit with an error>>
+}
+
+@
+Similarly to the input statement, we must also allow users to [[@define]] macros. First, macros must have an underlying representation that is useful for us.
+
+<<Type definitions>>=
+struct macro_s {
+    char* name;
+    int nlen;
+    int nargs;
+    char* substitution;
+    int slen;
+    int* insertion_points;
+};
+
+@
+While many of these attributes are simple enough (names, lengths, etc.), the [[int** insertion_points]] attribute deserves some discussion. When it comes time to apply a macro, we need some way to insert the values into the correct locations. The [[insertion_points]] array maps an index in the substitution string, to a parameter that should be written after that character.
+
+<<Define how to perform a macro substitution>>=
+void apply(struct macro_s* macro, int nargs, char* argv[], FILE* outfile)
+{
+    <<Check the number of arguments is correct>>
+    for (size_t i = 0; i < macro->slen && macro->substitution[i] != '\0'; i++) {
+        fputc(macro->substitution[i], outfile);
+        int arg_index = macro->insertion_points[i];
+        <<Check the argument index is valid>>
+        if (arg_index != -1 && arg_index < nargs) {
+            fprintf(outfile, "%s", argv[arg_index]);
+        }
+    }
+    APPLIED_MACRO=true;
+    fprintf(LOGFILE, "I just substituted macro \"%s\" ", macro->name);
+    fprintf(LOGFILE, "with the following arguments:\n");
+    for (size_t i = 0; i < nargs; i++) {
+        fprintf(LOGFILE, "\t\"%s\"\n", argv[i]);
+    }
+}
+
+@
+We indicate that we have applied a macro so that we can tell when a compilation pass no longer results in any changes.
+
+An easy mistake to make would be giving the wrong number of arguments.
+We should not allow that.
+
+<<Check the number of arguments is correct>>=
+if (nargs != macro->nargs) {
+    fprintf(stderr, "I could not expand the macro \"%s\", ", macro->name);
+    fprintf(stderr, "because I was given the wrong number of arguments.\n");
+    <<Exit with an error>>
+}
+
+@
+It is also possible we made a mistake earlier, when parsing the macro, and now the [[insertion_points]] array has led to a mistake.
+
+<<Check the argument index is valid>>=
+if (arg_index >= nargs) {
+    fprintf(stderr, "I have made a mistake substituting arguments into macro \"%s\": there is no argument '%d'!\n", macro->name, arg_index);
+    <<Exit with an error>>
+}
+
+@
+Although we can now apply a macro, this does not solve the problem of actually defining of a macro. Given all the information that the parser will easily extract, we have to create a [[struct macro_s]].
+
+<<Define how to define a new macro>>=
+void define(int nlen, char* name,
+            int slen, char* substitution,
+            int nargs, bool redefinition)
+{
+    struct macro_s* new_macro = malloc(sizeof(struct macro_s));
+    char* sub_string = calloc(slen + 1, sizeof(char));
+    int sub_string_len = 0;
+    <<Create a default [[insertion_points]] array>>
+    <<Convert a macro string into useful components>>
+    <<Resize the macro data appropriately>>
+    new_macro->name = calloc(nlen + 1, sizeof(char));
+    memcpy(new_macro->name, name, nlen+1);
+    new_macro->nlen = nlen;
+    new_macro->nargs = nargs;
+    new_macro->substitution = sub_string;
+    new_macro->slen = sub_string_len;
+    new_macro->insertion_points = insertion_points;
+    macro_table_insert(new_macro, redefinition);
+    if (redefinition) {
+        fprintf(LOGFILE, "I have updated the macro \"%s\".\n", name);
+    } else {
+        fprintf(LOGFILE, "I have created the macro \"%s\".\n", name);
+    }
+}
+
+@
+The default insertion points array is simply an array of [[-1]]'s that is as long as the [[substitution]] string.
+
+<<Create a default [[insertion_points]] array>>=
+int* insertion_points = malloc(slen * sizeof(int));
+for (int i = 0; i < slen; i++) {
+    insertion_points[i] = -1;
+}
+
+@
+And when we are all done, we should resize the new [[sub_string]] and [[insertion_points]] array to be the right size. If we do not, we are using more memory we need (and this is already not the most memory-efficient approach).
+
+<<Resize the macro data appropriately>>=
+char* new_sub_string = realloc(sub_string, (sub_string_len + 1) * sizeof(char));  // +1 for '\0'
+if (new_sub_string == NULL) {
+    <<Complain about memory problems>>
+}
+sub_string = new_sub_string;
+int* new_insertion_points = realloc(insertion_points, sub_string_len * sizeof(int));
+if (new_insertion_points == NULL) {
+    <<Complain about memory problems>>
+}
+insertion_points = new_insertion_points;
+@
+
+<<Complain about memory problems>>=
+fprintf(stderr, "I have run into some memory trouble while 'realloc-ing'.\n");
+<<Exit with an error>>
+
+@
+That covers the easy parts. All that remains is to actually build the new substitution [[sub_string]], and the corresponding [[insertion_points]] array. We do this by going through the original string and, when observing the (unescaped) character sequence [[@n]], where [[n]] is the parameter number (one-indexed), we do not write out the characters but instead insert a new entry to [[n-1]] (so we can work zero-indexed) in the [[insertion_points]] array.
+
+<<Convert a macro string into useful components>>=
+bool escaped = false;
+for (size_t i = 0; i < slen; i++) {
+    char c = substitution[i];
+    if (escaped) {
+        sub_string[sub_string_len++] = c;
+        escaped = false;
+    } else {
+        if (c == '\\') {
+            escaped = true;
+        } else if (c == '@') {
+            // We've found a parameter spot
+            i++; // Skip over the @
+            int param_index = 0;
+            <<Extract the parameter integer>>
+            if (param_index == 0) {
+                // This was an unescaped @ that is not a parameter
+                fprintf(LOGFILE, "It looks like you forgot to escape an @ ");
+                fprintf(LOGFILE, "in the definition of macro \"%s\".\n", name);
+                sub_string[sub_string_len++] = '@';
+            } else {
+                insertion_points[sub_string_len - 1] = param_index - 1;
+            }
+        } else {
+            sub_string[sub_string_len++] = c;
+        }
+    }
+}
+
+@
+To actually find which parameter we are interested in is a slightly delicate matter. We must move [[i]] over the characters in the integer, while noting what the characters are to make the integer!
+
+<<Extract the parameter integer>>=
+char c = substitution[i];
+while (isdigit(c)) {
+    param_index = (param_index * 10) + (c - '0');
+    c = substitution[++i];
+}
+i--;
+
+@
+We now have the basics of a macro system: we can define and apply macros, while also include libraries of predefined macros. From here we have a good chunk of the base code generator, and enough of a system to define a ``standard library'' of macros.
+
+
+\section{Macro compilation}
+\label{sec:compile-loop}
+The compile loop is an important part of [[cv]]. By not compiling the macros just once, but repeatedly, we increase the expressive power of the system in remarkable ways. Noting that we set a flag [[APPLIED_MACRO]] during compilation, we know when to stop running. Thus the whole compilation is summed up in a single loop.
+
+<<Define compilation>>=
+void compile(char* infile_name, char* outfile_name)
+{
+    FILE* input_file = fopen(infile_name, "r");
+    if (input_file == NULL) {
+        fprintf(stderr, "Failed to open input file \"%s\".", infile_name);
+        <<Exit with an error>>
+    }
+
+    FILE* output_file = fopen(outfile_name, "w");
+    if (output_file == NULL) {
+        fprintf(stderr, "Failed to open base code file \"%s\".", outfile_name);
+        <<Exit with an error>>
+    }
+
+    char* oldfile_name = calloc(256, sizeof(char));
+    sprintf(oldfile_name, "%s.old", outfile_name);
+
+    int run = 1;
+    do {
+        fprintf(LOGFILE, "I am starting run %d.\n", run);
+        APPLIED_MACRO = false;
+        if (run % 2 == 1) APPLIED_MACRO = true;
+        <<Perform one compilation run>>
+        if (APPLIED_MACRO) {
+            <<Shuffle the files around>>
+        }
+        run++;
+    } while (APPLIED_MACRO);
+    fclose(input_file);
+    fclose(output_file);
+    remove(oldfile_name);
+}
+
+@
+This does skip over a few details, of course. The file shuffle is fairly simple, and has to be dealt with eventually, so we will look at that now. We take the outfile, make it the set it as the infile, and repeat.
+
+<<Shuffle the files around>>=
+fclose(input_file);
+fclose(output_file);
+rename(outfile_name, oldfile_name);
+input_file = fopen(oldfile_name, "r");
+if (input_file == NULL) {
+    fprintf(stderr, "Failed to open old base code file \"%s\".", oldfile_name);
+    <<Exit with an error>>
+}
+output_file = fopen(outfile_name, "w");
+if (output_file == NULL) {
+    fprintf(stderr, "Failed to open base code file \"%s\".", outfile_name);
+    <<Exit with an error>>
+}
+
+@
+The compilation run is essentially a basic scanner through the input file, copying most characters verbatim, but applying special consideration to macros.
+
+<<Perform one compilation run>>=
+bool escaped = false;
+char c = fgetc(input_file);
+while (c != EOF) {
+    if (escaped) {
+        fputc(c, output_file);
+    } else {
+        if (c == '\\') {
+            escaped = true;
+        } else if (c == '@') {
+            <<Handle macro or special command>>
+        } else if (c == '#'){
+            <<Handle comments>>
+        } else {
+            fputc(c, output_file);
+        }
+    }
+    c = fgetc(input_file);
+}
+
+@
+We will consider the special cases in a second, but for now we will look at comments. These are signified by a hash symbol ([[#]]), and take effect until the end of the line.
+
+<<Handle comments>>=
+do {
+    c = fgetc(input_file);
+} while (c != '\n' && c != EOF);
+fseek(input_file, -1, SEEK_CUR);
+
+@
+When considering the special cases, we have to do a little bit of look-ahead. If the next identifier is one of the reserved [[input]] or [[define]], then parse them appropriately. Otherwise, we should assume it is a macro name, and apply the macro definition. One idiosyncracy of [[cv]] is that it parses only [[input]] commands on odd-numbered runs. Every other command is run on an even run.
+
+<<Handle macro or special command>>=
+char* id = calloc(256, sizeof(char)); // 256 should be long enough...
+int id_len = 0;
+<<Read identifier>>
+if (id_len == 6 && strncmp(id, "define", 6) == 0 && run % 2 == 0) {
+    <<Parse a macro definition>>
+} else if (id_len == 8 && strncmp(id, "redefine", 8) == 0 && run % 2 == 0) {
+    <<Parse a macro redefinition>>
+} else if (id_len == 5 && strncmp(id, "input", 5) == 0) {
+    fprintf(LOGFILE, "Odd run, only doing inputs.\n");
+    <<Parse a file input>>
+} else if (id_len > 0 && run % 2 == 0) {
+    <<Parse a macro call>>
+} else if (run % 2 == 1) {
+    fprintf(output_file, "@%s", id);
+} else {
+    fprintf(LOGFILE, "That macro name I just read does not have any letters in it. That cannot be right!\n");
+}
+free(id);
+
+@
+Before going any further, we quickly discuss how we define an identifier.
+For our purposes, an identifier is a sequence of letters, numbers and underscores.
+
+<<Read identifier>>=
+char k = fgetc(input_file);
+while((isalnum(k) || k == '_') && id_len < 255) {
+    id[id_len++] = k;
+    k = fgetc(input_file);
+}
+fseek(input_file, -1, SEEK_CUR);
+char* new_id = realloc(id, (id_len+1) * sizeof(char)); // +1 for '\0'
+if (new_id == NULL) {
+    <<Complain about memory problems>>
+}
+id = new_id;
+
+@
+First we shall consider an [[input]] command, for it is the simplest case. When an input command is processed, we should read in an opening paren then the filename, before reading a closing brace. Then we can send off the filename to the [[input]] function we defined earlier.
+
+<<Parse a file input>>=
+char** args = get_args(1, input_file);  // There should be a single "path" argument.
+if (strlen(args[0]) == 0) {
+    fprintf(LOGFILE, "The path supplied to input looks to be empty.\n");
+} else {
+    input(args[0], output_file);
+}
+free_args(1, args);
+
+@
+Next up, we handle macro definitions. The syntax we have already discussed is [[@define(name)(nargs)(substitution)]], so we simply read the information we need and hand it through to the [[define]] function from earler.
+
+<<Parse a macro definition>>=
+char** args = get_args(3, input_file);
+if (strlen(args[0]) == 0) {
+    fprintf(LOGFILE, "You are attempting to define a macro with no name. You cannot do that!\n");
+    <<Exit with an error>>
+} else {
+    int nargs = atoi(args[1]);
+    if (strlen(args[1]) == 0) {
+        nargs = 0;
+        fprintf(LOGFILE, "You did not tell me how many arguments the macro \"%s\" should have. I have assumed 0.\n", args[0]);
+    }
+    define(strlen(args[0]), args[0], strlen(args[2]), args[2], nargs, false);
+}
+free_args(3, args);
+
+@
+The redefinition case is almost identical.
+
+<<Parse a macro redefinition>>=
+char** args = get_args(3, input_file);
+if (strlen(args[0]) == 0) {
+    fprintf(LOGFILE, "You are attempting to redefine a macro with no name. You cannot do that!\n");
+    <<Exit with an error>>
+} else {
+    int nargs = atoi(args[1]);
+    if (strlen(args[1]) == 0) {
+        nargs = 0;
+        fprintf(LOGFILE, "You did not tell me how many arguments the macro \"%s\" should have. I have assumed 0.\n", args[0]);
+    }
+    define(strlen(args[0]), args[0], strlen(args[2]), args[2], nargs, true);
+}
+free_args(3, args);
+
+@
+Finally we will explore how we manage macro calls. This is a syntax we have not yet defined, but should be fairly clear from previous definition. We use \LaTeX{}'s convention of using multiple sets of braces, for example [[@power(x)(2)]] to mean $x^2$. Any sort of ``punctuation-separated list'' is inappropriate because many are used in writing, which will be arguments to the macros.
+
+<<Parse a macro call>>=
+struct macro_s* macro = get_macro_definition(id, id_len);
+if (macro == NULL) {
+    fprintf(LOGFILE, "I don't know about the macro \"%s\".\n", id);
+    <<Exit with an error>>
+}
+char** args = get_args(macro->nargs, input_file);
+apply(macro, macro->nargs, args, output_file);
+free_args(macro->nargs, args);
+
+@
+To make collecting arguments easier, we define a helper function [[get_args]] that extracts the number of arguments we expect.
+
+<<Define function [[get_args]]>>=
+char** get_args(int nargs, FILE* input_file)
+{
+    if (nargs == 0) return NULL;
+    char** args = calloc(nargs, sizeof(char*));
+    for (size_t i = 0; i < nargs; i++) {
+        char c = fgetc(input_file);
+        if (c != '(') {
+            fprintf(LOGFILE, "I was hoping to find an opening paren for the next argument, but all I found was '%c'.\n", c);
+            <<Exit with an error>>
+        }
+        int paren_depth = 1;
+        char* arg = calloc(4096, sizeof(char));
+        int arglen = 0;
+        c = fgetc(input_file);
+        if (c == ')') paren_depth--;
+        if (c == '(') paren_depth++;
+        while (paren_depth > 0 && arglen < 4095) {
+            arg[arglen++] = c;
+            c = fgetc(input_file);
+            if (c == ')') paren_depth--;
+            if (c == '(') paren_depth++;
+        }
+        arg[arglen++] = '\0';
+        char* new_arg = realloc(arg, arglen * sizeof(char));
+        if (new_arg == NULL) {
+            <<Complain about memory problems>>
+        }
+        arg = new_arg;
+        args[i] = arg;
+    }
+    return args;
+}
+
+@
+A corresponding [[free_args]] function is useful.
+
+<<Define function [[free_args]]>>=
+void free_args(int nargs, char** args)
+{
+    for (int i = 0; i < nargs; i++) {
+        free(args[i]);
+    }
+    free(args);
+}
+
+@
+One detail glossed over until now is how we store macros. Because there will potentially be a huge number of macros defined in a file, we cannot just throw them in an array and do a linear search each time. However a hash table usually need a load factor of about $0.6$. Both of these are entirely unacceptable, so instead we use a binary search tree.
+
+<<Type definitions>>=
+struct bst_s {
+    struct macro_s* macro;
+    struct bst_s* left;
+    struct bst_s* right;
+};
+
+@
+As of now, the binary search tree is not self-balancing. We hope for the best, and that there will be no ``cruel'' input. This cannot be guaranteed, of course, but with any luck people won't alphabetize their macros!
+
+The point is that the insert function is fairly strightforward. We traverse the tree to where we need to add the new macro, and extend the tree appropriately.
+
+<<Define the [[macro_table_insert]] function>>=
+void macro_table_insert(struct macro_s* macro, bool update)
+{
+    char* macro_name = macro->name;
+    int macro_nlen = macro->nlen;
+    struct bst_s* new_node = calloc(1, sizeof(struct bst_s));
+    new_node->macro = macro;
+    if (MACRO_TABLE == NULL) {
+        MACRO_TABLE = new_node;
+        return;
+    }
+    <<Traverse the BST>>
+    if (dir < 0 && node == NULL) {
+        parent->left = new_node;
+    } else if (dir > 0 && node == NULL) {
+        parent->right = new_node;
+    } else {
+        if (update) {
+            struct macro_s* old_macro = node->macro;
+            node->macro = new_node->macro;
+            free(new_node);
+            free(old_macro->name);
+            free(old_macro->substitution);
+            free(old_macro->insertion_points);
+        } else {
+            fprintf(LOGFILE, "The macro \"%s\" is taken.\n", macro_name);
+            <<Exit with an error>>
+        }
+    }
+}
+
+@
+Similarly we search for macros when we need to apply them.
+
+<<Define the [[get_macro_definition]] function>>=
+struct macro_s* get_macro_definition(char* macro_name, int macro_nlen) {
+    <<Traverse the BST>>
+    if (node == NULL) {
+        fprintf(LOGFILE, "I could not find the macro \"%s\".\n", macro_name);
+        <<Exit with an error>>
+    }
+    return node->macro;
+}
+
+@
+Both of these definitions skip the farely obvious next question: how do I traverse the BST? Here we fill in that blank.
+
+<<Traverse the BST>>=
+struct bst_s* parent = MACRO_TABLE; _unused(parent);
+struct bst_s* node = MACRO_TABLE;
+int dir = 0; // -1, 0, 1 == left, match, right
+while (node != NULL) {
+    int cmp_len = min(node->macro->nlen, macro_nlen);
+    dir = strncmp(macro_name, node->macro->name, cmp_len+1);
+    if (dir == 0) {
+        if (node->macro->nlen < macro_nlen) {
+            dir = -1;
+        } else if (node->macro->nlen > macro_nlen) {
+            dir = 1;
+        }
+    }
+    if (dir < 0) {
+        parent = node;
+        node = node->left;
+    } else if (dir > 0) {
+        parent = node;
+        node = node->right;
+    } else {
+        break;
+    }
+}
+
+@
+This needs a [[min]] command, so we may as well define the standard [[min]] and [[max]] macros as well. We also define an [[_unused]] macro for a couple of substitutions.
+
+<<Macros>>=
+#define max(a,b) \
+    ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+    _a > _b ? _a : _b; })
+#define min(a,b) \
+    ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+    _a < _b ? _a : _b; })
+#define _unused(x) ((void)(x))
+
+@
+This essentially concludes the compiling to base code. All that remains now is to build a nice interface to the compiler, and the front half is done. We shall approach this interface now.
+
+\section{Interface}
+\label{sec:interface}
+Because we are in C, all programs must follow a certain structure. Here we flesh out the main components, and start writing the rough guide to how the program will flow.
+
+<<main.c>>=
+<<Includes>>
+<<Macros>>
+<<Type definitions>>
+<<Main globals>>
+
+<<Define function [[get_args]]>>
+<<Define function [[free_args]]>>
+<<Define the [[macro_table_insert]] function>>
+<<Define the [[get_macro_definition]] function>>
+<<Define how to input the contents of another file>>
+<<Define how to perform a macro substitution>>
+<<Define how to define a new macro>>
+<<Define compilation>>
+<<Define [[print_help]]>>
+
+int main(int argc, char* argv[])
+{
+    <<Parse the arguments>>
+
+    char* logfile_name = calloc(256, sizeof(char));
+    sprintf(logfile_name, "%s.cvlog", basename);
+    LOGFILE = fopen(logfile_name, "w");
+    if (LOGFILE == NULL) {
+        fprintf(stderr, "Failed to open log file \"%s\".", logfile_name);
+        <<Exit with an error>>
+    }
+
+    fprintf(LOGFILE, "I will be using the basename \"%s\".\n", basename);
+
+    char* infile_name = calloc(256, sizeof(char));
+    sprintf(infile_name, "%s.cv", basename);
+
+    char* outfile_name = calloc(256, sizeof(char));
+    sprintf(outfile_name, "%s.base", basename);
+
+    compile(infile_name, outfile_name);
+
+    <<Convert the outfile to the appropriate target>>
+
+    free(infile_name);
+    free(outfile_name);
+    free(logfile_name);
+
+    return 0;
+}
+
+@
+First, we include the standard C libraries.
+
+<<Includes>>=
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <string.h>
+#include <getopt.h>
+
+@
+There are a few global variables we need to define as well. Yes, yes, globals are bad, but these are rather safe.
+
+<<Main globals>>=
+bool APPLIED_MACRO = false;
+FILE* LOGFILE = NULL;
+struct bst_s* MACRO_TABLE = NULL;
+int N_LIB_DIRS = 0;
+char** LIB_DIRS = NULL;
+
+@
+We have already defined some of the types and macros we will need. We will add to these as necessary. That means we can now move on to parsing arguments.
+
+<<Parse the arguments>>=
+<<Use getopt for fancy stuff>>
+<<Extract the positional arguments>>
+
+@
+We will start with the positional arguments, because there is only one: the [[basename]] of the [[.cv]] file.
+
+<<Extract the positional arguments>>=
+char* basename = NULL;
+if (optind < argc) {
+    basename = argv[optind];
+} else {
+    print_help();
+    <<Exit with an error>>
+}
+
+@
+For now, we skip any fancy flags and stuff. We will come back to that when we have defined the output formats.
+
+It is also a good idea to help the user by providing some sort of help screen, which we do with the [[print_help]] function.
+
+<<Define [[print_help]]>>=
+void print_help(void)
+{
+    printf("cv FILE [FORMATS ...]\n\n");
+    printf("One file becomes every format a CV could ever need.\n\n");
+    printf("Output formats:\n");
+    <<Print the format help>>
+}
+
+@
+THE FOLLOWING IS A PLACEHODLER
+
+<<Use getopt for fancy stuff>>=
+int optind = 1;
+
+@
+THE FOLLOWING IS A PLACEHODLER
+
+<<Print the format help>>=
+;
+
+@
+THE FOLLOWING IS A PLACEHOLDER
+
+<<Convert the outfile to the appropriate target>>=
+fprintf(LOGFILE, "I have compiled the file.\n");
+
+@
+THE FOLLOWING IS A PLACEHODLER
+
+<<Exit with an error>>=
+fprintf(stderr, "I have encountered an error, please check the log.\n");
+exit(1);
