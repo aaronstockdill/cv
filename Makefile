@@ -19,7 +19,7 @@ main.c: main.nw
 	$(TANGLE) -R$@ $< > $@
 
 documentation.tex: main.nw
-	$(WEAVE) $< > $@
+	$(WEAVE) -delay $< > $@
 
 .PHONY: clean
 clean:
