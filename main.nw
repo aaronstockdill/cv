@@ -339,7 +339,8 @@ if (output_file == NULL) {
 The compilation run is essentially a basic scanner through the input file, copying most characters verbatim, but applying special consideration to macros.
 
 <<Perform one compilation run>>=
-bool escaped = false;
+LINENO = 1;
+bool escaped = false; bool new_line = true;
 char c = fgetc(input_file);
 while (c != EOF) {
     if (escaped) {
@@ -354,6 +355,11 @@ while (c != EOF) {
         } else {
             fputc(c, output_file);
         }
+    }
+    if (new_line) new_line = false;
+    if (c == '\n') {
+        LINENO++;
+        new_line = true;
     }
     c = fgetc(input_file);
 }
@@ -378,13 +384,16 @@ if (id_len == 6
  && strncmp(id, "define", 6) == 0
  && run % 2 == 0) {
     <<Parse a macro definition>>
+    <<Selectively gobble whitespace>>
 } else if (id_len == 8
         && strncmp(id, "redefine", 8) == 0
         && run % 2 == 0) {
     <<Parse a macro redefinition>>
+    <<Selectively gobble whitespace>>
 } else if (id_len == 5
         && strncmp(id, "input", 5) == 0) {
     <<Parse a file input>>
+    <<Selectively gobble whitespace>>
 } else if (id_len > 0
         && run % 2 == 0) {
     <<Parse a macro call>>
@@ -398,14 +407,18 @@ if (id_len == 6
 free(id);
 
 @
-Before going any further, we quickly discuss how we define an identifier.
-For our purposes, an identifier is a sequence of letters, numbers and underscores.
+Before going any further, we quickly discuss how we define an identifier. For our purposes, an identifier is a sequence of letters, numbers and underscores. The first character cannot be a number.
 
 <<Read identifier>>=
-char k = fgetc(input_file);
-while((isalnum(k) || k == '_') && id_len < 255) {
-    id[id_len++] = k;
-    k = fgetc(input_file);
+c = fgetc(input_file);
+while((isalnum(c) || c == '_') && id_len < 255) {
+    if (id_len == 0 && isdigit(c) && run % 2 == 0) {
+        fprintf(LOGFILE, "It looks like this macro starts "
+                         "with a digit. It shouldn't.\n");
+        <<Exit with an error>>
+    }
+    id[id_len++] = c;
+    c = fgetc(input_file);
 }
 fseek(input_file, -1, SEEK_CUR);
 char* new_id = realloc(
@@ -484,6 +497,31 @@ if (strlen(args[0]) == 0) {
 free_args(3, args);
 
 @
+A quick interlude, before we handle macro calls. Due to how these commands are designed, we must be careful about how the whitespace following them is consumed. For example, if we [[@input]] a file, we want to make sure that the newline that followed is ignored, but if it is inline (i.e. preceeded or followed by other text) we probably want any spacing preserved! Similarly for [[@(re)define]]: whitespace after them should be gobbled, unless it isn't followed by a newline. For both of these purposes, we will consider a comment character [[#]] to be a newline.
+
+But there is another edge case as well. If the definition is not the first thing on the line, the whitespace might matter! So we must check to see if we started a new line. If we did not, leave it alone. If we did, do other checks.
+
+<<Selectively gobble whitespace>>=
+if (!new_line) {
+    // Space might be important, leave it.
+} else {
+    int ws_count = -1;
+    do {
+        ws_count++;
+        c = fgetc(input_file);
+    } while (c == ' ' || c == '\t');
+    if (c == '\n' || c == '#') {
+        // End of line, gobbling complete.
+        while (c != '\n') {
+            c = fgetc(input_file);
+        }
+    } else {
+        // The whitespace was important. Oops!
+        fseek(input_file, -ws_count, SEEK_CUR);
+    }
+}
+
+@
 Finally we will explore how we manage macro calls. This is a syntax we have not yet defined, but should be fairly clear from previous definition. We use \LaTeX{}'s convention of using multiple sets of braces, for example [[@power(x)(2)]] to mean $x^2$. Any sort of ``punctuation-separated list'' is inappropriate because many are used in writing, which will be arguments to the macros.
 
 <<Parse a macro call>>=
@@ -497,12 +535,23 @@ apply(macro, macro->nargs, args, output_file);
 free_args(macro->nargs, args);
 
 @
-To make collecting arguments easier, we define a helper function [[get_args]] that extracts the number of arguments we expect.
+To make collecting arguments easier, we define a helper function [[get_args]] that extracts the number of arguments we expect. The edge case is a zero-argument macro. To avoid excessive typing, it allows a ``no-parens'' syntax. That is, if a macro has no parameters, the name alone is fine. However, you can add empty parens after the macro to terminate the name, which will be consumed.
 
 <<Define function [[get_args]]>>=
 char** get_args(int nargs, FILE* input_file)
 {
-    if (nargs == 0) return NULL;
+    if (nargs == 0) {
+        char c = fgetc(input_file);
+        if (c == '(') {
+            c = fgetc(input_file);
+            if (c != ')') {
+                fseek(input_file, -2, SEEK_CUR);
+            } // else consume both of ( and )
+        } else {
+            fseek(input_file, -1, SEEK_CUR);
+        }
+        return NULL;
+    }
     char** args = calloc(nargs, sizeof(char*));
     for (size_t i = 0; i < nargs; i++) {
         char c = fgetc(input_file);
@@ -700,6 +749,8 @@ int main(int argc, char* argv[])
 
     compile(infile_name, outfile_name);
 
+    // parse(outfile_name);
+
     <<Convert the outfile to the appropriate target>>
 
     free(infile_name);
@@ -729,6 +780,7 @@ FILE* LOGFILE = NULL;
 struct bst_s* MACRO_TABLE = NULL;
 int N_LIB_DIRS = 0;
 char** LIB_DIRS = NULL;
+int LINENO = 1;
 
 @
 We have already defined some of the types and macros we will need. We will add to these as necessary. That means we can now move on to parsing arguments.
@@ -786,8 +838,9 @@ fprintf(LOGFILE, "I have compiled the file.\n");
 THE FOLLOWING IS A PLACEHODLER
 
 <<Exit with an error>>=
-fprintf(stderr, "I have encountered an error, "
-                "please check the log.\n");
+// Currently, line numbers are useless because of the "multisteps"
+fprintf(stderr, "I have encountered an error on line %d, "
+                "please check the log.\n", LINENO);
 exit(1);
 
 @
